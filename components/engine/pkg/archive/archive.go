@@ -204,6 +204,32 @@ func DecompressStream(archive io.Reader) (io.ReadCloser, error) {
 	}
 }
 
+func pigzCompress(output io.Writer) (io.WriteCloser, <-chan struct{}, error) {
+	chdone := make(chan struct{})
+	pigzCmd := exec.Command("pigz", "-c", "--no-name", "--no-time")
+
+	pigzCmd.Stdout = output
+	pipeR, pipeW := io.Pipe()
+	pigzCmd.Stdin = pipeR
+	var errBuf bytes.Buffer
+	pigzCmd.Stderr = &errBuf
+
+	if err := pigzCmd.Start(); err != nil {
+		return nil, nil, err
+	}
+
+	go func() {
+		if err := pigzCmd.Wait(); err != nil {
+			pipeR.CloseWithError(fmt.Errorf("%s: %s", err, errBuf.String()))
+		} else {
+			pipeR.Close()
+		}
+		close(chdone)
+	}()
+
+	return pipeW, chdone, nil
+}
+
 // CompressStream compresseses the dest with specified compression algorithm.
 func CompressStream(dest io.Writer, compression Compression) (io.WriteCloser, error) {
 	p := pools.BufioWriter32KPool
@@ -213,8 +239,23 @@ func CompressStream(dest io.Writer, compression Compression) (io.WriteCloser, er
 		writeBufWrapper := p.NewWriteCloserWrapper(buf, buf)
 		return writeBufWrapper, nil
 	case Gzip:
+		var writeBufWrapper io.WriteCloser
+		if os.Getenv("USE_PIGZ_COMPRESS") == "Y" {
+			logrus.Debugf("Attempting compression using pigz")
+			pigzWriter, chdone, err := pigzCompress(dest)
+			if err == nil {
+				writeBufWrapper = p.NewWriteCloserWrapper(buf, pigzWriter)
+
+				return ioutils.NewWriteCloserWrapper(writeBufWrapper, func() error {
+					<-chdone
+					return writeBufWrapper.Close()
+				}), nil
+			}
+			logrus.Warnf("Error trying to compress with pigz: %v", err)
+		}
+
 		gzWriter := gzip.NewWriter(dest)
-		writeBufWrapper := p.NewWriteCloserWrapper(buf, gzWriter)
+		writeBufWrapper = p.NewWriteCloserWrapper(buf, gzWriter)
 		return writeBufWrapper, nil
 	case Bzip2, Xz:
 		// archive/bzip2 does not support writing, and there is no xz support at all
